@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Shiftboard</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <div class="top"><div><h1>Shiftboard</h1><p class="sub" id="sub">Employers post open shifts. Workers claim them.</p></div><div id="who"></div></div>
+  <div id="app"></div>
+</main>
+<script type="module">
+/* ===== DATA LAYER =====
+   Everything the UI needs from a backend lives in `api`. All methods are async.
+   Accounts and profiles now use Firebase (Auth + Firestore). Shifts are still in
+   localStorage and move to Firestore in the next step. */
+const K={shifts:"sb-shifts3"};
+const rd=(k,d)=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):d}catch(e){return d}};
+const wr=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}};
+/* ----- Firebase setup: paste your web app config from the Firebase console ----- */
+const firebaseConfig={
+  apiKey:"AIzaSyAH_Qu56pp6FK_miLDSbkOVDDeD5Xd111A",
+  authDomain:"jobfinder-280b3.firebaseapp.com",
+  projectId:"jobfinder-280b3",
+  storageBucket:"jobfinder-280b3.firebasestorage.app",
+  messagingSenderId:"386559241147",
+  appId:"1:386559241147:web:3d85823bda65448aba329e"
+};
+const fbConfigured=!/YOUR_/.test(firebaseConfig.apiKey);
+const FB_CDN="https://www.gstatic.com/firebasejs/10.14.1/";
+let fb=null,fbError="";
+async function fbInit(){
+  if(!fbConfigured)return;
+  try{
+    const [app,auth,store]=await Promise.all([import(FB_CDN+"firebase-app.js"),import(FB_CDN+"firebase-auth.js"),import(FB_CDN+"firebase-firestore.js")]);
+    const a=app.initializeApp(firebaseConfig);
+    fb={...app,...auth,...store,auth:auth.getAuth(a),db:store.getFirestore(a)};
+  }catch(e){fbError="Couldn’t load Firebase. Check your connection and reload the page."}
+}
+const AUTH_MSG={
+  "auth/email-already-in-use":"An account with this email already exists. Log in instead.",
+  "auth/invalid-credential":"Email or password is incorrect.",
+  "auth/wrong-password":"Email or password is incorrect.",
+  "auth/user-not-found":"Email or password is incorrect.",
+  "auth/invalid-email":"That email address isn’t valid.",
+  "auth/weak-password":"Password must be at least 6 characters.",
+  "auth/too-many-requests":"Too many attempts. Wait a few minutes and try again.",
+  "auth/network-request-failed":"Network problem. Check your connection and try again.",
+  "auth/user-disabled":"This account has been disabled."
+};
+const fbErr=e=>new Error(AUTH_MSG[e&&e.code]||"Something went wrong. Try again.");
+const need=()=>{if(fbError)throw new Error(fbError);if(!fb)throw new Error("Firebase isn’t set up yet. Add your project settings to firebaseConfig.")};
+const profile=async uid=>{const snap=await fb.getDoc(fb.doc(fb.db,"users",uid));return snap.exists()?{id:uid,...snap.data()}:null};
+const api={
+  async signUp(d){
+    need();
+    const email=d.email.trim().toLowerCase();
+    let cred;
+    try{cred=await fb.createUserWithEmailAndPassword(fb.auth,email,d.password)}catch(e){throw fbErr(e)}
+    /* Self-service sign-up always creates a worker. Employer accounts are created by the team. */
+    const rec={email,type:"worker",first:d.first.trim(),last:d.last.trim(),phone:d.phone.trim()};
+    try{await fb.setDoc(fb.doc(fb.db,"users",cred.user.uid),rec)}
+    catch(e){try{await fb.deleteUser(cred.user)}catch(_){}throw new Error("Couldn’t save your profile. Try creating the account again.")}
+    return{id:cred.user.uid,...rec};
+  },
+  async logIn(email,password){
+    need();
+    let cred;
+    try{cred=await fb.signInWithEmailAndPassword(fb.auth,email.trim().toLowerCase(),password)}catch(e){throw fbErr(e)}
+    let u;
+    try{u=await profile(cred.user.uid)}catch(e){await fb.signOut(fb.auth);throw new Error("Couldn’t load your profile. Check your Firestore rules.")}
+    if(!u){await fb.signOut(fb.auth);throw new Error("This account has no profile yet. Contact the Shiftboard team.")}
+    if(u.active===false){await fb.signOut(fb.auth);throw new Error("This business account is suspended. Contact the Shiftboard team.")}
+    return u;
+  },
+  async resetPassword(email){
+    need();
+    try{await fb.sendPasswordResetEmail(fb.auth,email.trim().toLowerCase())}
+    catch(e){if(e.code!=="auth/user-not-found")throw fbErr(e)}
+  },
+  async logOut(){if(fb)await fb.signOut(fb.auth)},
+  async getUser(id){if(!fb)return null;try{return await profile(id)}catch(e){return null}},
+  async restore(){
+    await fbInit();
+    if(!fb)return null;
+    const fu=await new Promise(res=>{const off=fb.onAuthStateChanged(fb.auth,x=>{off();res(x)})});
+    if(!fu)return null;
+    try{const u=await profile(fu.uid);return u&&u.active===false?null:u}catch(e){return null}
+  },
+  async updateUser(id,f){need();await fb.setDoc(fb.doc(fb.db,"users",id),f,{merge:true});return profile(id)},
+  async loadShifts(){need();const q=await fb.getDocs(fb.collection(fb.db,"shifts"));return q.docs.map(d=>({id:d.id,...d.data()}))},
+  async addShift(x){need();await fb.addDoc(fb.collection(fb.db,"shifts"),x)},
+  async claim(id,u){need();const ref=fb.doc(fb.db,"shifts",id);
+    await fb.runTransaction(fb.db,async tx=>{const sn=await tx.get(ref);
+      if(!sn.exists())throw new Error("This shift was removed.");
+      if(sn.data().workerId)throw new Error("Someone else just claimed this shift.");
+      tx.update(ref,{workerId:u.id,by:name(u),phone:u.phone})})},
+  async drop(id){need();await fb.updateDoc(fb.doc(fb.db,"shifts",id),{workerId:fb.deleteField(),by:fb.deleteField(),phone:fb.deleteField()})},
+  async delShift(id){need();await fb.deleteDoc(fb.doc(fb.db,"shifts",id))},
+  async listBusinesses(){need();const q=await fb.getDocs(fb.query(fb.collection(fb.db,"users"),fb.where("type","==","employer")));return q.docs.map(d=>({id:d.id,...d.data()}))},
+  async setActive(id,on){need();await fb.updateDoc(fb.doc(fb.db,"users",id),{active:on})},
+  /* Admin only: creates the login on a throwaway second app so the admin stays signed in. */
+  async createBusiness(b){
+    need();
+    const email=b.email.trim().toLowerCase(),A="abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    const pw=Array.from(crypto.getRandomValues(new Uint8Array(12)),x=>A[x%A.length]).join("");
+    const sec=fb.initializeApp(firebaseConfig,"sec"+Date.now()),sa=fb.getAuth(sec);
+    let cred;
+    try{cred=await fb.createUserWithEmailAndPassword(sa,email,pw)}catch(e){await fb.deleteApp(sec);throw fbErr(e)}
+    try{await fb.setDoc(fb.doc(fb.db,"users",cred.user.uid),{email,type:"employer",biz:b.biz.trim(),city:b.city.trim(),country:b.country.trim(),phone:b.phone.trim(),about:(b.about||"").trim(),active:true,createdAt:Date.now()})}
+    catch(e){try{await fb.deleteUser(cred.user)}catch(_){}await fb.deleteApp(sec);throw new Error("Couldn’t save the business. Check your Firestore rules.")}
+    let sent=true;
+    try{await fb.sendPasswordResetEmail(sa,email)}catch(e){sent=false}
+    await fb.signOut(sa);await fb.deleteApp(sec);
+    return{pw,sent};
+  }
+};
+
+/* ===== UI ===== */
+let user=null,shifts=[],mode="login",tab="shifts",filter="All",err="",ob=null,view=null,onlyMatch=true,customN="",info="",authDraft={},note="",postDraft={},bizList=[],bizDraft={},made=null,hidden=new Set();
+const $=id=>document.getElementById(id);
+const NICHES=["Restaurants & Cafés","Hotels & Hospitality","Retail & Shops","Healthcare","Events & Catering","Warehouse & Logistics","Cleaning","Construction","Delivery & Drivers","Beauty & Wellness","Childcare","Security"];
+const COUNTRIES=["Albania","Austria","Belgium","Brazil","Bulgaria","Canada","Croatia","Cyprus","Czechia","Denmark","Estonia","Finland","France","Germany","Greece","Hungary","Iceland","India","Ireland","Italy","Latvia","Lithuania","Malta","Mexico","Netherlands","Norway","Poland","Portugal","Romania","Serbia","Slovakia","Slovenia","Spain","Sweden","Switzerland","Turkey","United Arab Emirates","United Kingdom","United States"];
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const name=u=>u.type==="employer"?u.biz:((u.first||"")+" "+(u.last||"")).trim();
+const fmt=s=>new Date(s.date+"T00:00").toLocaleDateString(undefined,{weekday:"short",month:"short",day:"numeric"})+", "+s.start+"–"+s.end;
+const hrs=s=>{const f=x=>{const[h,m]=x.split(":");return+h+m/60};return(f(s.end)-f(s.start)+24)%24};
+const span=s=>{const st=new Date(s.date+"T"+s.start).getTime();return{start:st,end:st+hrs(s)*36e5}};
+const past=s=>span(s).end<Date.now();
+const byDate=(a,b)=>span(a).start-span(b).start;
+const money=(s,n)=>(s.cur||"€")+n;
+const reload=async()=>{try{shifts=await api.loadShifts();if(user&&user.type==="admin")bizList=await api.listBusinesses();if(user&&user.type==="worker")hidden=new Set((await api.listBusinesses()).filter(b=>b.active===false).map(b=>b.id))}catch(e){shifts=[];note="Couldn’t load shifts. Check your Firestore rules."}};
+const noteBox=()=>note?`<div class="card"><div class="err" role="alert">${esc(note)}</div></div>`:"";
+const PH='pattern="[0-9+ \\(\\)\\-]{7,}" title="Enter a valid phone number"';
+function card(s,actions,tag){return `<div class="card" data-act="open" data-v="${s.id}"><div class="row"><div><div class="t"><button class="link" data-act="open" data-v="${s.id}">${esc(s.role)}</button></div><div class="m">${esc(s.biz)}</div><div class="m">${fmt(s)}</div><div class="m">${esc([s.city,s.niche].filter(Boolean).join(" · "))}</div></div><div class="pay">${money(s,s.pay)}/h</div></div>${tag||""}${actions?`<div class="btns">${actions}</div>`:""}</div>`}
+const low=s=>String(s||"").trim().toLowerCase();
+const match=s=>{const p=user.prefs;return low(s.country)===low(p.country)&&low(s.city)===low(p.city)&&p.niches.some(n=>low(n)===low(s.niche))};
+const errBox=()=>err?`<div class="err" role="alert">${esc(err)}</div>`:"";
+const infoBox=()=>info?`<div class="m" role="status" style="color:var(--ok)">${esc(info)}</div>`:"";
+const setupBox=()=>fbError?`<div class="card"><div class="err" role="alert">${esc(fbError)}</div></div>`:!fbConfigured?`<div class="card"><div class="err" role="alert">Firebase isn’t set up yet. Paste your project settings into <code>firebaseConfig</code> in this file.</div></div>`:"";
+
+function authV(){
+  const seg=(a,l,cur)=>`<button type="button" role="tab" data-act="${a.k}" data-v="${a.v}" aria-selected="${cur}">${l}</button>`;
+  const tabs=`<div class="tabs" role="tablist">${seg({k:"mode",v:"login"},"Log in",mode==="login")}${seg({k:"mode",v:"signup"},"Create account",mode==="signup")}</div>`;
+  const dv=k=>esc(authDraft[k]);
+  if(mode==="login")return setupBox()+tabs+`<div class="card"><form id="login"><label>Email<input name="email" type="email" required autocomplete="email" value="${dv("email")}"></label><label>Password<input name="password" type="password" required autocomplete="current-password"></label>${errBox()}${infoBox()}<button class="btn">Log in</button><button type="button" class="link m" data-act="reset" style="font-weight:600">Forgot your password?</button></form></div><p class="note">Employer accounts are set up by the Shiftboard team.</p>`;
+  return setupBox()+tabs+`<div class="card"><form id="signup">
+  <div class="two"><label>First name<input name="first" required autocomplete="given-name" value="${dv("first")}"></label><label>Last name<input name="last" required autocomplete="family-name" value="${dv("last")}"></label></div>
+  <label>Phone number<input name="phone" type="tel" required autocomplete="tel" placeholder="+1 555 123 4567" value="${dv("phone")}" ${PH}></label>
+  <label>Email<input name="email" type="email" required autocomplete="email" value="${dv("email")}"></label>
+  <label>Password (6+ characters)<input name="password" type="password" minlength="6" required autocomplete="new-password"></label>
+  ${errBox()}<button class="btn">Create account</button></form></div><p class="note">Are you a business? Employer accounts are set up by the Shiftboard team.</p>`;
+}
+function workerV(){
+  const roles=["All",...new Set(shifts.map(s=>s.role))];
+  if(!roles.includes(filter))filter="All";
+  const open=shifts.filter(s=>!s.workerId&&(!onlyMatch||match(s))&&(filter==="All"||s.role===filter)&&!past(s)&&!hidden.has(s.ownerId)).sort(byDate);
+  const mine=shifts.filter(s=>s.workerId===user.id).sort(byDate);
+  const tot={};mine.forEach(s=>{const c=s.cur||"€";tot[c]=(tot[c]||0)+hrs(s)*s.pay});const earn=Object.entries(tot).map(([c,n])=>c+n.toFixed(0)).join(" + ");
+  return `<div class="card"><div class="m">Looking in ${esc(user.prefs.city)}, ${esc(user.prefs.country)} · ${esc(user.prefs.niches.join(", "))}</div><label style="display:flex;gap:8px;align-items:center;margin-top:8px"><input type="checkbox" id="om" style="width:auto"${onlyMatch?" checked":""}>Only show shifts that match my preferences</label></div><label>Filter by role<select id="f">${roles.map(r=>`<option${r===filter?" selected":""}>${esc(r)}</option>`).join("")}</select></label>
+  <h2>Open shifts</h2>
+  ${open.length?open.map(s=>card(s,`<button class="btn" data-act="claim" data-v="${s.id}">Claim shift</button>`)).join(""):`<div class="empty">No open shifts match right now. Untick the preferences filter to see all shifts, or check back soon.</div>`}
+  <h2>My shifts${mine.length?` · est. ${earn}`:""}</h2>
+  ${mine.length?mine.map(s=>card(s,`<button class="btn ghost" data-act="drop" data-v="${s.id}">Give up shift</button>`,`<span class="tag ok">Confirmed</span>`)).join(""):`<div class="empty">You haven’t claimed a shift yet.</div>`}`;
+}
+const stat=(n,l)=>`<div class="card stat"><div class="n">${n}</div><div class="m">${l}</div></div>`;
+function adminV(){
+  const live=shifts.filter(s=>!past(s));
+  const cnt=id=>{const m=shifts.filter(s=>s.ownerId===id);return m.length+" shifts · "+m.filter(s=>s.workerId).length+" filled"};
+  return `<div class="stats">${stat(bizList.length,"Businesses")}${stat(live.filter(s=>!s.workerId).length,"Open shifts")}${stat(live.filter(s=>s.workerId).length,"Filled shifts")}</div>
+  ${made?`<div class="card"><div class="t">Account created for ${esc(made.biz)}</div><div class="m">Login: ${esc(made.email)}<br>Temporary password: <b>${esc(made.pw)}</b> (shown once)</div><div class="m" style="margin-top:6px">${made.sent?"A link to set their own password was emailed to them.":"The email couldn’t be sent. Share the temporary password with them directly."}</div></div>`:""}
+  <h2>Add a business</h2><div class="card"><form id="newbiz">
+  <label>Business name<input name="biz" required value="${esc(bizDraft.biz)}"></label>
+  <label>Login email<input name="email" type="email" required value="${esc(bizDraft.email)}"></label>
+  <label>Phone number<input name="phone" type="tel" required value="${esc(bizDraft.phone)}" ${PH}></label>
+  <div class="two"><label>Country<input name="country" list="cl2" required value="${esc(bizDraft.country)}"></label><label>City<input name="city" required value="${esc(bizDraft.city)}"></label></div><datalist id="cl2">${COUNTRIES.map(c=>`<option>${c}</option>`).join("")}</datalist>
+  <label>About the business (optional)<textarea name="about" rows="3">${esc(bizDraft.about)}</textarea></label>
+  ${errBox()}<button class="btn">Create business account</button></form></div>
+  <h2>Businesses</h2>${bizList.length?bizList.map(b=>`<div class="card"><div class="row"><div><div class="t">${esc(b.biz)}</div><div class="m">${esc([b.city,b.country].filter(Boolean).join(", "))} · ${esc(b.email)}</div><div class="m">${cnt(b.id)}</div>${b.active===false?`<span class="tag warn">Paused</span>`:""}</div><button class="btn ghost" data-act="toggle" data-v="${b.id}">${b.active===false?"Reactivate":"Pause"}</button></div></div>`).join(""):`<div class="empty">No businesses yet. Add the first one above.</div>`}
+  <h2>All shifts</h2>${shifts.length?[...shifts].sort(byDate).map(s=>card(s,"",s.workerId?`<span class="tag ok">Filled by ${esc(s.by)}</span>`:`<span class="tag warn">Open</span>`)).join(""):`<div class="empty">No shifts posted yet.</div>`}`;
+}
+function employerV(){
+  const mine=shifts.filter(s=>s.ownerId===user.id).sort(byDate);
+  const up=mine.filter(s=>!past(s));
+  return `<div class="stats">${stat(up.filter(s=>!s.workerId).length,"Open")}${stat(up.filter(s=>s.workerId).length,"Filled")}${stat(mine.filter(s=>past(s)&&s.workerId).length,"Completed")}</div><div class="card"><form id="post">
+  <div class="m">Posting as ${esc(user.biz)}${user.city?" · "+esc(user.city)+", "+esc(user.country):""}</div>
+  <label>Role<input name="role" required placeholder="e.g. Server" value="${esc(postDraft.role)}"></label>
+  <label>Niche<select name="niche" required>${NICHES.map(n=>`<option${postDraft.niche===n?" selected":""}>${esc(n)}</option>`).join("")}</select></label>
+  <label>Date<input name="date" type="date" required min="${new Date().toISOString().slice(0,10)}" value="${esc(postDraft.date)}"></label>
+  <div class="two"><label>Start<input name="start" type="time" required value="${esc(postDraft.start||"09:00")}"></label><label>End<input name="end" type="time" required value="${esc(postDraft.end||"15:00")}"></label></div>
+  <div class="m">An end time earlier than the start means the shift runs overnight.</div>
+  <div class="two"><label>Pay per hour<input name="pay" type="number" min="1" step="0.5" required value="${esc(postDraft.pay||"15")}"></label><label>Currency<select name="cur">${["€","$","£"].map(c=>`<option${(postDraft.cur||"€")===c?" selected":""}>${c}</option>`).join("")}</select></label></div>
+  <label>Job description<textarea name="desc" rows="4" required placeholder="What will the person do? Any requirements?">${esc(postDraft.desc)}</textarea></label>
+  ${errBox()}<button class="btn">Post shift</button></form></div>
+  <h2>My posted shifts</h2>
+  ${mine.length?mine.map(s=>card(s,(s.workerId?`<button class="btn ghost" data-act="worker" data-v="${s.workerId}">View worker</button>`:"")+`<button class="btn ghost" data-act="del" data-v="${s.id}">Remove shift</button>`,s.workerId?`<span class="tag ok">Filled by ${esc(s.by)} · ${esc(s.phone)}</span>`:`<span class="tag warn">Open</span>`)).join(""):`<div class="empty">You haven’t posted any shifts. Use the form above.</div>`}`;
+}
+function profileV(){
+  const w=user.type==="worker";
+  return `<div class="card"><form id="profile">
+  <label>Email<input value="${esc(user.email)}" readonly></label>
+  ${w?`<div class="two"><label>First name<input name="first" required value="${esc(user.first)}"></label><label>Last name<input name="last" required value="${esc(user.last)}"></label></div>`:`<label>Business name<input name="biz" required value="${esc(user.biz)}"></label><label>About your business<textarea name="about" rows="4">${esc(user.about)}</textarea></label>`}
+  <label>Phone number<input name="phone" type="tel" required value="${esc(user.phone)}" ${PH}></label>
+  ${errBox()}<button class="btn">Save profile</button></form>${w?`<div class="btns"><button class="btn ghost" data-act="editprefs">Edit job preferences</button></div>`:""}</div>${w?entries(user,true):""}`;
+}
+function entries(u,own){
+  const row=(t,m,k,i)=>`<div class="card"><div class="row"><div><div class="t">${esc(t)}</div><div class="m">${esc(m)}</div></div>${own?`<button class="btn ghost" data-act="${k}" data-v="${i}">Remove</button>`:""}</div></div>`;
+  const none=t=>`<div class="empty">${t}</div>`;
+  const edu=(u.edu||[]).map((x,i)=>row(x.school,[x.degree,x.years].filter(Boolean).join(" · "),"rmedu",i)).join("")||none(own?"No education added yet.":"No education listed.");
+  const exp=(u.exp||[]).map((x,i)=>row(x.role+" at "+x.company,[x.years,x.desc].filter(Boolean).join(" · "),"rmexp",i)).join("")||none(own?"No work experience added yet.":"No work experience listed.");
+  return `<h2>Education</h2>${edu}${own?`<div class="card"><form id="edu"><label>School or course<input name="school" required></label><div class="two"><label>Degree or field<input name="degree"></label><label>Years<input name="years" placeholder="2019–2022"></label></div><button class="btn">Add education</button></form></div>`:""}
+  <h2>Work experience</h2>${exp}${own?`<div class="card"><form id="exp"><div class="two"><label>Company<input name="company" required></label><label>Role<input name="role" required></label></div><label>Years<input name="years" placeholder="2021–2023"></label><label>What you did (optional)<input name="desc"></label><button class="btn">Add experience</button></form></div>`:""}`;
+}
+function workerPV(){
+  const u=view.u;
+  return `<button class="btn ghost" data-act="back">Back</button><h2>${esc(((u.first||"")+" "+(u.last||"")).trim())}</h2><div class="card"><div class="m">Phone: ${esc(u.phone)}</div>${u.prefs?`<div class="m">Looking in ${esc(u.prefs.city)}, ${esc(u.prefs.country)} · ${esc(u.prefs.niches.join(", "))}</div>`:""}</div>${entries(u,false)}`;
+}
+function detailV(){
+  const back=`<button class="btn ghost" data-act="back">Back</button>`;
+  const s=shifts.find(x=>x.id===view.id);
+  if(!s)return back+`<div class="empty">This shift is no longer available.</div>`;
+  const e=view.emp;let act="";
+  if(user.type==="worker"){act=!s.workerId?`<button class="btn" data-act="claim" data-v="${s.id}">Claim shift</button>`:s.workerId===user.id?`<span class="tag ok">Confirmed</span><button class="btn ghost" data-act="drop" data-v="${s.id}">Give up shift</button>`:`<span class="tag">Already filled</span>`}
+  else if(s.workerId)act=`<button class="btn ghost" data-act="worker" data-v="${s.workerId}">View worker</button>`;
+  const n=shifts.filter(x=>x.ownerId===s.ownerId&&!x.workerId).length;
+  const loc=[(e&&e.city)||s.city,(e&&e.country)||s.country].filter(Boolean).join(", ");
+  return back+`<h2>${esc(s.role)}</h2>
+  <div class="card"><div class="row"><div><div class="t">${esc(s.biz)}</div><div class="m">${fmt(s)} (${+hrs(s).toFixed(1)}h)</div><div class="m">${esc([s.city,s.country].filter(Boolean).join(", "))}</div><div class="m">${esc(s.niche||"")}</div></div><div class="pay">${money(s,s.pay)}/h</div></div><div class="m" style="margin-top:6px">Estimated pay: ${money(s,(hrs(s)*s.pay).toFixed(0))}</div>${act?`<div class="btns">${act}</div>`:""}</div>
+  <h2>Job description</h2><div class="card">${esc(s.desc||"The employer hasn’t added a description yet.").replace(/\n/g,"<br>")}</div>
+  <h2>About the employer</h2><div class="card"><div class="t">${esc(e?e.biz:s.biz)}</div><div class="m">${esc(loc)}</div><p>${esc((e&&e.about)||"No business description yet.")}</p><div class="m">${n} open shift${n===1?"":"s"} right now</div></div>`;
+}
+function obV(){
+  const list=[...NICHES,...ob.niches.filter(n=>!NICHES.includes(n))];
+  return `<h2 style="margin-top:0">What work are you looking for?</h2><div class="card"><form id="onboard">
+  <label>Country<input name="country" list="cl" required autocomplete="country-name" value="${esc(ob.country)}"></label><datalist id="cl">${COUNTRIES.map(c=>`<option>${c}</option>`).join("")}</datalist>
+  <label>City<input name="city" required autocomplete="address-level2" value="${esc(ob.city)}"></label>
+  <div class="m">Working niches (pick one or more)</div>
+  <div class="chips">${list.map(n=>`<button type="button" class="chip" data-act="niche" data-v="${esc(n)}" aria-pressed="${ob.niches.includes(n)}">${esc(n)}</button>`).join("")}</div>
+  <div class="two" style="grid-template-columns:1fr auto"><input id="cn" placeholder="Add your own niche" value="${esc(customN)}"><button type="button" class="btn ghost" data-act="addniche">Add</button></div>
+  ${errBox()}<button class="btn">Save and continue</button></form></div>`;
+}
+function render(){
+  const who=$("who");
+  if(!user){who.innerHTML="";$("app").innerHTML=authV();return}
+  if(user.type==="worker"&&(!user.prefs||ob)){
+    if(!ob)ob={country:"",city:"",niches:[]};
+    who.innerHTML=`<button class="btn ghost" data-act="logout">Log out</button>`;$("app").innerHTML=obV();return}
+  who.innerHTML=`<div class="m" style="text-align:right">${esc(name(user))}<br>${{worker:"Worker",employer:"Employer",admin:"Admin"}[user.type]}</div><button class="btn ghost" data-act="logout" style="margin-top:6px">Log out</button>`;
+  if(user.type==="admin"){$("app").innerHTML=noteBox()+(view?(view.kind==="shift"?detailV():workerPV()):adminV());return}
+  const t=`<div class="tabs" role="tablist"><button role="tab" data-act="tab" data-v="shifts" aria-selected="${tab==="shifts"}">Shifts</button><button role="tab" data-act="tab" data-v="profile" aria-selected="${tab==="profile"}">My profile</button></div>`;
+  $("app").innerHTML=t+noteBox()+(view?(view.kind==="shift"?detailV():workerPV()):tab==="profile"?profileV():user.type==="worker"?workerV():employerV());
+  const f=$("f");if(f)f.onchange=e=>{filter=e.target.value;render()};
+  const om=$("om");if(om)om.onchange=e=>{onlyMatch=e.target.checked;render()};
+}
+$("app").onclick=async e=>{
+  const b=e.target.closest("[data-act]");if(!b)return;
+  const a=b.dataset.act,v=b.dataset.v;err="";info="";note="";
+  if(a==="mode")mode=v;
+  if(a==="reset"){try{const em=(authDraft.email||"").trim();if(!em)throw new Error("Enter your email above, then tap “Forgot your password?”.");await api.resetPassword(em);info="If an account exists for "+em+", a reset link is on its way."}catch(x){err=x.message}}
+  if(a==="tab"){tab=v;view=null}
+  if(a==="open"){const s0=shifts.find(x=>x.id===v);view={kind:"shift",id:v,emp:s0?await api.getUser(s0.ownerId):null}}
+  if(a==="worker"){const s0=shifts.find(x=>x.workerId===v);view={kind:"worker",u:(await api.getUser(v))||{first:s0?s0.by:"Worker",last:"",phone:s0?s0.phone:""}}}
+  if(a==="back")view=null;
+  if(a==="rmedu"||a==="rmexp"){const k=a==="rmedu"?"edu":"exp";user=await api.updateUser(user.id,{[k]:(user[k]||[]).filter((_,i)=>i!=v)})}
+  if(a==="niche"){const i=ob.niches.indexOf(v);i<0?ob.niches.push(v):ob.niches.splice(i,1)}
+  if(a==="addniche"){const n=customN.trim();if(n&&!ob.niches.some(x=>low(x)===low(n)))ob.niches.push(n);customN=""}
+  if(a==="editprefs")ob={...user.prefs,niches:[...user.prefs.niches]};
+  if(a==="logout"){await api.logOut();user=null;shifts=[];authDraft={};mode="login";tab="shifts";ob=null;view=null}
+  const s=shifts.find(x=>x.id===v);
+  if(a==="toggle"){const b0=bizList.find(x=>x.id===v);try{await api.setActive(v,b0.active===false)}catch(x){note=x.message}await reload()}
+  if(a==="claim"&&s){try{const m=span(s);
+    if(past(s))throw new Error("This shift has already ended.");
+    if(shifts.some(x=>x.workerId===user.id&&span(x).start<m.end&&m.start<span(x).end))throw new Error("This overlaps a shift you’ve already claimed.");
+    await api.claim(v,user)}catch(x){note=x.message}await reload()}
+  if(a==="drop"&&s){try{await api.drop(v)}catch(x){note=x.message}await reload()}
+  if(a==="del"&&s){try{if(s.workerId&&!confirm("This shift is already taken by "+s.by+". Remove it anyway?"))throw new Error("");await api.delShift(v)}catch(x){note=x.message}await reload()}
+  render();
+};
+document.addEventListener("click",e=>{const b=e.target.closest('[data-act="logout"]');if(b&&b.closest("#who"))$("app").onclick({target:b})});
+$("app").onsubmit=async e=>{
+  e.preventDefault();
+  if(e.target.id==="onboard"&&document.activeElement&&document.activeElement.id==="cn"){$("app").onclick({target:document.querySelector('[data-act="addniche"]')});return}
+  const d=Object.fromEntries(new FormData(e.target)),id=e.target.id;err="";info="";
+  const sb=e.target.querySelector('button:not([type="button"])');if(sb)sb.disabled=true;
+  try{
+    if(id==="login"){user=await api.logIn(d.email,d.password);tab="shifts";authDraft={};await reload()}
+    if(id==="signup"){user=await api.signUp(d);tab="shifts";authDraft={};await reload()}
+    if(id==="post"){
+      if(d.end===d.start)throw new Error("Start and end time can’t be the same.");
+      if(past(d))throw new Error("That shift is in the past.");
+      await api.addShift({ownerId:user.id,biz:user.biz,country:user.country,city:user.city,niche:d.niche,role:d.role.trim(),desc:d.desc.trim(),date:d.date,start:d.start,end:d.end,pay:+d.pay,cur:d.cur});
+      postDraft={};await reload();
+    }
+    if(id==="newbiz"){made=null;const r=await api.createBusiness(d);made={email:d.email.trim().toLowerCase(),biz:d.biz.trim(),...r};bizDraft={};await reload()}
+    if(id==="profile"){user=await api.updateUser(user.id,{...d,phone:d.phone.trim()});tab="shifts"}
+    if(id==="edu")user=await api.updateUser(user.id,{edu:[...(user.edu||[]),{school:d.school.trim(),degree:d.degree.trim(),years:d.years.trim()}]});
+    if(id==="exp")user=await api.updateUser(user.id,{exp:[...(user.exp||[]),{company:d.company.trim(),role:d.role.trim(),years:d.years.trim(),desc:d.desc.trim()}]});
+    if(id==="onboard"){
+      if(!ob.niches.length)throw new Error("Pick at least one niche.");
+      user=await api.updateUser(user.id,{prefs:{country:d.country.trim(),city:d.city.trim(),niches:ob.niches}});ob=null;tab="shifts";
+    }
+  }catch(x){err=x.message}
+  render();
+};
+$("app").oninput=e=>{const n=e.target;
+  const D=n.form&&({login:authDraft,signup:authDraft,post:postDraft,newbiz:bizDraft})[n.form.id];
+  if(D){if(n.name&&n.name!=="password")D[n.name]=n.value;return}
+  if(!ob)return;if(n.name==="country")ob.country=n.value;if(n.name==="city")ob.city=n.value;if(n.id==="cn")customN=n.value};
+(async()=>{user=await api.restore();if(user)await reload();render()})();
+</script>
+</body>
+</html>
